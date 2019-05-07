@@ -41,7 +41,7 @@ function importScriptsDependsOnBrowser() {
         insertScriptSrcInHtmlDom('/vendor/adapter.js');
     }
 }
-importScriptsDependsOnBrowser();
+//importScriptsDependsOnBrowser();
 var usePlanB = false;
 if (browser.name === 'Chrome' || browser.name === 'Chromium') {
     logger.debug(browser.name + ': using SDP PlanB');
