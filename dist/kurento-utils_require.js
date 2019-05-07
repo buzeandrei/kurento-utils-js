@@ -36,9 +36,9 @@ function insertScriptSrcInHtmlDom(scriptSrc) {
 }
 function importScriptsDependsOnBrowser() {
     if (browser.name === 'IE') {
-        insertScriptSrcInHtmlDom('https://cdn.temasys.io/adapterjs/0.15.x/adapter.debug.js');
+        insertScriptSrcInHtmlDom('/vendor/adapter.debug.js');
     } else {
-        insertScriptSrcInHtmlDom('https://raw.githubusercontent.com/webrtcHacks/adapter/master/release/adapter.js');
+        insertScriptSrcInHtmlDom('/vendor/adapter.js');
     }
 }
 importScriptsDependsOnBrowser();
