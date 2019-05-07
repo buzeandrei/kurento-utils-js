@@ -28,6 +28,20 @@ var MEDIA_CONSTRAINTS = {
 var ua = window && window.navigator ? window.navigator.userAgent : '';
 var parser = new UAParser(ua);
 var browser = parser.getBrowser();
+function insertScriptSrcInHtmlDom(scriptSrc) {
+    var script = document.createElement('script');
+    script.src = scriptSrc;
+    var ref = document.querySelector('script');
+    ref.parentNode.insertBefore(script, ref);
+}
+function importScriptsDependsOnBrowser() {
+    if (browser.name === 'IE') {
+        insertScriptSrcInHtmlDom('https://cdn.temasys.io/adapterjs/0.15.x/adapter.debug.js');
+    } else {
+        insertScriptSrcInHtmlDom('/webjars/webrtc-adapter/release/adapter.js');
+    }
+}
+importScriptsDependsOnBrowser();
 var usePlanB = false;
 if (browser.name === 'Chrome' || browser.name === 'Chromium') {
     logger.debug(browser.name + ': using SDP PlanB');
@@ -51,14 +65,22 @@ var dumpSDP = function (description) {
 };
 function bufferizeCandidates(pc, onerror) {
     var candidatesQueue = [];
-    pc.addEventListener('signalingstatechange', function () {
-        if (this.signalingState === 'stable') {
+    function setSignalingstatechangeAccordingWwebBrowser(functionToExecute, pc) {
+        if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+            pc.onsignalingstatechange = functionToExecute;
+        } else {
+            pc.addEventListener('signalingstatechange', functionToExecute);
+        }
+    }
+    var signalingstatechangeFunction = function () {
+        if (pc.signalingState === 'stable') {
             while (candidatesQueue.length) {
                 var entry = candidatesQueue.shift();
                 pc.addIceCandidate(entry.candidate, entry.callback, entry.callback);
             }
         }
-    });
+    };
+    setSignalingstatechangeAccordingWwebBrowser(signalingstatechangeFunction, pc);
     return function (candidate, callback) {
         callback = callback || onerror;
         switch (pc.signalingState) {
@@ -110,6 +132,21 @@ function getSimulcastInfo(videoStream) {
         ];
     lines.push('');
     return lines.join('\n');
+}
+function sleep(milliseconds) {
+    var start = new Date().getTime();
+    for (var i = 0; i < 10000000; i++) {
+        if (new Date().getTime() - start > milliseconds) {
+            break;
+        }
+    }
+}
+function setIceCandidateAccordingWebBrowser(functionToExecute, pc) {
+    if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+        pc.onicecandidate = functionToExecute;
+    } else {
+        pc.addEventListener('icecandidate', functionToExecute);
+    }
 }
 function WebRtcPeer(mode, options, callback) {
     if (!(this instanceof WebRtcPeer)) {
@@ -206,7 +243,7 @@ function WebRtcPeer(mode, options, callback) {
             }
         }
     }
-    pc.addEventListener('icecandidate', function (event) {
+    var iceCandidateFunction = function (event) {
         var candidate = event.candidate;
         if (EventEmitter.listenerCount(self, 'icecandidate') || EventEmitter.listenerCount(self, 'candidategatheringdone')) {
             if (candidate) {
@@ -216,10 +253,16 @@ function WebRtcPeer(mode, options, callback) {
                 } else {
                     cand = candidate;
                 }
-                self.emit('icecandidate', cand);
+                if (typeof AdapterJS === 'undefined') {
+                    self.emit('icecandidate', cand);
+                }
                 candidategatheringdone = false;
             } else if (!candidategatheringdone) {
-                self.emit('candidategatheringdone');
+                if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+                    EventEmitter.prototype.emit('candidategatheringdone', cand);
+                } else {
+                    self.emit('candidategatheringdone');
+                }
                 candidategatheringdone = true;
             }
         } else if (!candidategatheringdone) {
@@ -227,7 +270,8 @@ function WebRtcPeer(mode, options, callback) {
             if (!candidate)
                 candidategatheringdone = true;
         }
-    });
+    };
+    setIceCandidateAccordingWebBrowser(iceCandidateFunction, pc);
     pc.onaddstream = options.onaddstream;
     pc.onnegotiationneeded = options.onnegotiationneeded;
     this.on('newListener', function (event, listener) {
@@ -266,19 +310,38 @@ function WebRtcPeer(mode, options, callback) {
             };
         var constraints = browserDependantConstraints;
         logger.debug('constraints: ' + JSON.stringify(constraints));
-        pc.createOffer(constraints).then(function (offer) {
-            logger.debug('Created SDP offer');
-            offer = mangleSdpToAddSimulcast(offer);
-            return pc.setLocalDescription(offer);
-        }).then(function () {
-            var localDescription = pc.localDescription;
-            logger.debug('Local description set', localDescription.sdp);
-            if (multistream && usePlanB) {
-                localDescription = interop.toUnifiedPlan(localDescription);
-                logger.debug('offer::origPlanB->UnifiedPlan', dumpSDP(localDescription));
-            }
-            callback(null, localDescription.sdp, self.processAnswer.bind(self));
-        }).catch(callback);
+        if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+            var setLocalDescriptionOnSuccess = function () {
+                sleep(1000);
+                var localDescription = pc.localDescription;
+                logger.debug('Local description set', localDescription.sdp);
+                if (multistream && usePlanB) {
+                    localDescription = interop.toUnifiedPlan(localDescription);
+                    logger.debug('offer::origPlanB->UnifiedPlan', dumpSDP(localDescription));
+                }
+                callback(null, localDescription.sdp, self.processAnswer.bind(self));
+            };
+            var createOfferOnSuccess = function (offer) {
+                logger.debug('Created SDP offer');
+                logger.debug('Local description set', pc.localDescription);
+                pc.setLocalDescription(offer, setLocalDescriptionOnSuccess, callback);
+            };
+            pc.createOffer(createOfferOnSuccess, callback, constraints);
+        } else {
+            pc.createOffer(constraints).then(function (offer) {
+                logger.debug('Created SDP offer');
+                offer = mangleSdpToAddSimulcast(offer);
+                return pc.setLocalDescription(offer);
+            }).then(function () {
+                var localDescription = pc.localDescription;
+                logger.debug('Local description set', localDescription.sdp);
+                if (multistream && usePlanB) {
+                    localDescription = interop.toUnifiedPlan(localDescription);
+                    logger.debug('offer::origPlanB->UnifiedPlan', dumpSDP(localDescription));
+                }
+                callback(null, localDescription.sdp, self.processAnswer.bind(self));
+            }).catch(callback);
+        }
     };
     this.getLocalSessionDescriptor = function () {
         return pc.localDescription;
@@ -292,12 +355,19 @@ function WebRtcPeer(mode, options, callback) {
             var stream = pc.getRemoteStreams()[0];
             remoteVideo.srcObject = stream;
             logger.debug('Remote stream:', stream);
-            remoteVideo.load();
+            if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+                remoteVideo = attachMediaStream(remoteVideo, stream);
+            } else {
+                remoteVideo.load();
+            }
         }
     }
     this.showLocalVideo = function () {
         localVideo.srcObject = videoStream;
         localVideo.muted = true;
+        if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+            localVideo = attachMediaStream(localVideo, videoStream);
+        }
     };
     this.send = function (data) {
         if (dataChannel && dataChannel.readyState === 'open') {
@@ -397,10 +467,17 @@ function WebRtcPeer(mode, options, callback) {
             if (constraints === undefined) {
                 constraints = MEDIA_CONSTRAINTS;
             }
-            navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
-                videoStream = stream;
-                start();
-            }).catch(callback);
+            if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+                navigator.getUserMedia(constraints, function (stream) {
+                    videoStream = stream;
+                    start();
+                }, callback);
+            } else {
+                navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
+                    videoStream = stream;
+                    start();
+                }).catch(callback);
+            }
         }
         if (sendSource === 'webcam') {
             getMedia(mediaConstraints);
@@ -420,13 +497,17 @@ function WebRtcPeer(mode, options, callback) {
         if (localVideo) {
             localVideo.pause();
             localVideo.srcObject = null;
-            localVideo.load();
+            if (typeof AdapterJS === 'undefined') {
+                localVideo.load();
+            }
             localVideo.muted = false;
         }
         if (remoteVideo) {
             remoteVideo.pause();
             remoteVideo.srcObject = null;
-            remoteVideo.load();
+            if (typeof AdapterJS === 'undefined') {
+                remoteVideo.load();
+            }
         }
         self.removeAllListeners();
         if (window.cancelChooseDesktopMedia !== undefined) {
@@ -505,7 +586,9 @@ WebRtcPeer.prototype.dispose = function () {
     } catch (err) {
         logger.warn('Exception disposing webrtc peer ' + err);
     }
-    this.emit('_dispose');
+    if (typeof AdapterJS === 'undefined') {
+        this.emit('_dispose');
+    }
 };
 function WebRtcPeerRecvonly(options, callback) {
     if (!(this instanceof WebRtcPeerRecvonly)) {
