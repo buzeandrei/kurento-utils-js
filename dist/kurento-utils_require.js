@@ -2,7 +2,7 @@
 var freeice = require('freeice');
 var inherits = require('inherits');
 var UAParser = require('ua-parser-js');
-var uuid = require('uuid');
+var uuidv4 = require('uuid/v4');
 var hark = require('hark');
 var EventEmitter = require('events').EventEmitter;
 var recursive = require('merge').recursive.bind(undefined, true);
@@ -28,6 +28,20 @@ var MEDIA_CONSTRAINTS = {
 var ua = window && window.navigator ? window.navigator.userAgent : '';
 var parser = new UAParser(ua);
 var browser = parser.getBrowser();
+function insertScriptSrcInHtmlDom(scriptSrc) {
+    var script = document.createElement('script');
+    script.src = scriptSrc;
+    var ref = document.querySelector('script');
+    ref.parentNode.insertBefore(script, ref);
+}
+function importScriptsDependsOnBrowser() {
+    if (browser.name === 'IE') {
+        insertScriptSrcInHtmlDom('https://cdn.temasys.io/adapterjs/0.15.x/adapter.debug.js');
+    } else {
+        insertScriptSrcInHtmlDom('/webjars/webrtc-adapter/release/adapter.js');
+    }
+}
+importScriptsDependsOnBrowser();
 var usePlanB = false;
 if (browser.name === 'Chrome' || browser.name === 'Chromium') {
     logger.debug(browser.name + ': using SDP PlanB');
@@ -51,14 +65,22 @@ var dumpSDP = function (description) {
 };
 function bufferizeCandidates(pc, onerror) {
     var candidatesQueue = [];
-    pc.addEventListener('signalingstatechange', function () {
-        if (this.signalingState === 'stable') {
+    function setSignalingstatechangeAccordingWwebBrowser(functionToExecute, pc) {
+        if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+            pc.onsignalingstatechange = functionToExecute;
+        } else {
+            pc.addEventListener('signalingstatechange', functionToExecute);
+        }
+    }
+    var signalingstatechangeFunction = function () {
+        if (pc.signalingState === 'stable') {
             while (candidatesQueue.length) {
                 var entry = candidatesQueue.shift();
                 pc.addIceCandidate(entry.candidate, entry.callback, entry.callback);
             }
         }
-    });
+    };
+    setSignalingstatechangeAccordingWwebBrowser(signalingstatechangeFunction, pc);
     return function (candidate, callback) {
         callback = callback || onerror;
         switch (pc.signalingState) {
@@ -111,6 +133,21 @@ function getSimulcastInfo(videoStream) {
     lines.push('');
     return lines.join('\n');
 }
+function sleep(milliseconds) {
+    var start = new Date().getTime();
+    for (var i = 0; i < 10000000; i++) {
+        if (new Date().getTime() - start > milliseconds) {
+            break;
+        }
+    }
+}
+function setIceCandidateAccordingWebBrowser(functionToExecute, pc) {
+    if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+        pc.onicecandidate = functionToExecute;
+    } else {
+        pc.addEventListener('icecandidate', functionToExecute);
+    }
+}
 function WebRtcPeer(mode, options, callback) {
     if (!(this instanceof WebRtcPeer)) {
         return new WebRtcPeer(mode, options, callback);
@@ -134,7 +171,7 @@ function WebRtcPeer(mode, options, callback) {
     var dataChannelConfig = options.dataChannelConfig;
     var useDataChannels = options.dataChannels || false;
     var dataChannel;
-    var guid = uuid.v4();
+    var guid = uuidv4();
     var configuration = recursive({ iceServers: freeice() }, options.configuration);
     var onicecandidate = options.onicecandidate;
     if (onicecandidate)
@@ -206,7 +243,25 @@ function WebRtcPeer(mode, options, callback) {
             }
         }
     }
-    pc.addEventListener('icecandidate', function (event) {
+    if (!pc.getLocalStreams && pc.getSenders) {
+        pc.getLocalStreams = function () {
+            var stream = new MediaStream();
+            pc.getSenders().forEach(function (sender) {
+                stream.addTrack(sender.track);
+            });
+            return [stream];
+        };
+    }
+    if (!pc.getRemoteStreams && pc.getReceivers) {
+        pc.getRemoteStreams = function () {
+            var stream = new MediaStream();
+            pc.getReceivers().forEach(function (sender) {
+                stream.addTrack(sender.track);
+            });
+            return [stream];
+        };
+    }
+    var iceCandidateFunction = function (event) {
         var candidate = event.candidate;
         if (EventEmitter.listenerCount(self, 'icecandidate') || EventEmitter.listenerCount(self, 'candidategatheringdone')) {
             if (candidate) {
@@ -216,10 +271,16 @@ function WebRtcPeer(mode, options, callback) {
                 } else {
                     cand = candidate;
                 }
-                self.emit('icecandidate', cand);
+                if (typeof AdapterJS === 'undefined') {
+                    self.emit('icecandidate', cand);
+                }
                 candidategatheringdone = false;
             } else if (!candidategatheringdone) {
-                self.emit('candidategatheringdone');
+                if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+                    EventEmitter.prototype.emit('candidategatheringdone', cand);
+                } else {
+                    self.emit('candidategatheringdone');
+                }
                 candidategatheringdone = true;
             }
         } else if (!candidategatheringdone) {
@@ -227,7 +288,8 @@ function WebRtcPeer(mode, options, callback) {
             if (!candidate)
                 candidategatheringdone = true;
         }
-    });
+    };
+    setIceCandidateAccordingWebBrowser(iceCandidateFunction, pc);
     pc.onaddstream = options.onaddstream;
     pc.onnegotiationneeded = options.onnegotiationneeded;
     this.on('newListener', function (event, listener) {
@@ -264,21 +326,46 @@ function WebRtcPeer(mode, options, callback) {
                 offerToReceiveAudio: mode !== 'sendonly' && offerAudio,
                 offerToReceiveVideo: mode !== 'sendonly' && offerVideo
             };
+        if (mode === 'recvonly' && pc.addTransceiver && browserDependantConstraints.offerToReceiveAudio) {
+            pc.addTransceiver('audio');
+        }
+        if (mode === 'recvonly' && pc.addTransceiver && browserDependantConstraints.offerToReceiveVideo) {
+            pc.addTransceiver('video');
+        }
         var constraints = browserDependantConstraints;
         logger.debug('constraints: ' + JSON.stringify(constraints));
-        pc.createOffer(constraints).then(function (offer) {
-            logger.debug('Created SDP offer');
-            offer = mangleSdpToAddSimulcast(offer);
-            return pc.setLocalDescription(offer);
-        }).then(function () {
-            var localDescription = pc.localDescription;
-            logger.debug('Local description set', localDescription.sdp);
-            if (multistream && usePlanB) {
-                localDescription = interop.toUnifiedPlan(localDescription);
-                logger.debug('offer::origPlanB->UnifiedPlan', dumpSDP(localDescription));
-            }
-            callback(null, localDescription.sdp, self.processAnswer.bind(self));
-        }).catch(callback);
+        if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+            var setLocalDescriptionOnSuccess = function () {
+                sleep(1000);
+                var localDescription = pc.localDescription;
+                logger.debug('Local description set', localDescription.sdp);
+                if (multistream && usePlanB) {
+                    localDescription = interop.toUnifiedPlan(localDescription);
+                    logger.debug('offer::origPlanB->UnifiedPlan', dumpSDP(localDescription));
+                }
+                callback(null, localDescription.sdp, self.processAnswer.bind(self));
+            };
+            var createOfferOnSuccess = function (offer) {
+                logger.debug('Created SDP offer');
+                logger.debug('Local description set', pc.localDescription);
+                pc.setLocalDescription(offer, setLocalDescriptionOnSuccess, callback);
+            };
+            pc.createOffer(createOfferOnSuccess, callback, constraints);
+        } else {
+            pc.createOffer(constraints).then(function (offer) {
+                logger.debug('Created SDP offer');
+                offer = mangleSdpToAddSimulcast(offer);
+                return pc.setLocalDescription(offer);
+            }).then(function () {
+                var localDescription = pc.localDescription;
+                logger.debug('Local description set', localDescription.sdp);
+                if (multistream && usePlanB) {
+                    localDescription = interop.toUnifiedPlan(localDescription);
+                    logger.debug('offer::origPlanB->UnifiedPlan', dumpSDP(localDescription));
+                }
+                callback(null, localDescription.sdp, self.processAnswer.bind(self));
+            }).catch(callback);
+        }
     };
     this.getLocalSessionDescriptor = function () {
         return pc.localDescription;
@@ -292,12 +379,19 @@ function WebRtcPeer(mode, options, callback) {
             var stream = pc.getRemoteStreams()[0];
             remoteVideo.srcObject = stream;
             logger.debug('Remote stream:', stream);
-            remoteVideo.load();
+            if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+                remoteVideo = attachMediaStream(remoteVideo, stream);
+            } else {
+                remoteVideo.load();
+            }
         }
     }
     this.showLocalVideo = function () {
         localVideo.srcObject = videoStream;
         localVideo.muted = true;
+        if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+            localVideo = attachMediaStream(localVideo, videoStream);
+        }
     };
     this.send = function (data) {
         if (dataChannel && dataChannel.readyState === 'open') {
@@ -381,10 +475,14 @@ function WebRtcPeer(mode, options, callback) {
             self.showLocalVideo();
         }
         if (videoStream) {
-            pc.addStream(videoStream);
+            videoStream.getTracks().forEach(function (track) {
+                pc.addTrack(track, videoStream);
+            });
         }
         if (audioStream) {
-            pc.addStream(audioStream);
+            audioStream.getTracks().forEach(function (track) {
+                pc.addTrack(track, audioStream);
+            });
         }
         var browser = parser.getBrowser();
         if (mode === 'sendonly' && (browser.name === 'Chrome' || browser.name === 'Chromium') && browser.major === 39) {
@@ -397,10 +495,17 @@ function WebRtcPeer(mode, options, callback) {
             if (constraints === undefined) {
                 constraints = MEDIA_CONSTRAINTS;
             }
-            navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
-                videoStream = stream;
-                start();
-            }).catch(callback);
+            if (typeof AdapterJS !== 'undefined' && AdapterJS.webrtcDetectedBrowser === 'IE' && AdapterJS.webrtcDetectedVersion >= 9) {
+                navigator.getUserMedia(constraints, function (stream) {
+                    videoStream = stream;
+                    start();
+                }, callback);
+            } else {
+                navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
+                    videoStream = stream;
+                    start();
+                }).catch(callback);
+            }
         }
         if (sendSource === 'webcam') {
             getMedia(mediaConstraints);
@@ -420,13 +525,17 @@ function WebRtcPeer(mode, options, callback) {
         if (localVideo) {
             localVideo.pause();
             localVideo.srcObject = null;
-            localVideo.load();
+            if (typeof AdapterJS === 'undefined') {
+                localVideo.load();
+            }
             localVideo.muted = false;
         }
         if (remoteVideo) {
             remoteVideo.pause();
             remoteVideo.srcObject = null;
-            remoteVideo.load();
+            if (typeof AdapterJS === 'undefined') {
+                remoteVideo.load();
+            }
         }
         self.removeAllListeners();
         if (window.cancelChooseDesktopMedia !== undefined) {
@@ -505,7 +614,9 @@ WebRtcPeer.prototype.dispose = function () {
     } catch (err) {
         logger.warn('Exception disposing webrtc peer ' + err);
     }
-    this.emit('_dispose');
+    if (typeof AdapterJS === 'undefined') {
+        this.emit('_dispose');
+    }
 };
 function WebRtcPeerRecvonly(options, callback) {
     if (!(this instanceof WebRtcPeerRecvonly)) {
@@ -536,7 +647,7 @@ exports.WebRtcPeerRecvonly = WebRtcPeerRecvonly;
 exports.WebRtcPeerSendonly = WebRtcPeerSendonly;
 exports.WebRtcPeerSendrecv = WebRtcPeerSendrecv;
 exports.hark = harkUtils;
-},{"events":4,"freeice":5,"hark":8,"inherits":9,"kurento-browser-extensions":10,"merge":11,"sdp-translator":18,"ua-parser-js":21,"uuid":23}],2:[function(require,module,exports){
+},{"events":4,"freeice":5,"hark":8,"inherits":9,"kurento-browser-extensions":10,"merge":11,"sdp-translator":18,"ua-parser-js":21,"uuid/v4":24}],2:[function(require,module,exports){
 if (window.addEventListener)
     module.exports = require('./index');
 },{"./index":3}],3:[function(require,module,exports){
@@ -1104,7 +1215,7 @@ module.exports = function(stream, options) {
   return harker;
 }
 
-},{"wildemitter":24}],9:[function(require,module,exports){
+},{"wildemitter":25}],9:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -4000,202 +4111,81 @@ exports.parse = function(sdp) {
 })(typeof window === 'object' ? window : this);
 
 },{}],22:[function(require,module,exports){
-(function (global){
-
-var rng;
-
-var crypto = global.crypto || global.msCrypto; // for IE 11
-if (crypto && crypto.getRandomValues) {
-  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
-  // Moderately fast, high quality
-  var _rnds8 = new Uint8Array(16);
-  rng = function whatwgRNG() {
-    crypto.getRandomValues(_rnds8);
-    return _rnds8;
-  };
+/**
+ * Convert array of 16 byte values to UUID string format of the form:
+ * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+ */
+var byteToHex = [];
+for (var i = 0; i < 256; ++i) {
+  byteToHex[i] = (i + 0x100).toString(16).substr(1);
 }
 
-if (!rng) {
+function bytesToUuid(buf, offset) {
+  var i = offset || 0;
+  var bth = byteToHex;
+  // join used to fix memory issue caused by concatenation: https://bugs.chromium.org/p/v8/issues/detail?id=3175#c4
+  return ([bth[buf[i++]], bth[buf[i++]], 
+	bth[buf[i++]], bth[buf[i++]], '-',
+	bth[buf[i++]], bth[buf[i++]], '-',
+	bth[buf[i++]], bth[buf[i++]], '-',
+	bth[buf[i++]], bth[buf[i++]], '-',
+	bth[buf[i++]], bth[buf[i++]],
+	bth[buf[i++]], bth[buf[i++]],
+	bth[buf[i++]], bth[buf[i++]]]).join('');
+}
+
+module.exports = bytesToUuid;
+
+},{}],23:[function(require,module,exports){
+// Unique ID creation requires a high quality random # generator.  In the
+// browser this is a little complicated due to unknown quality of Math.random()
+// and inconsistent support for the `crypto` API.  We do the best we can via
+// feature-detection
+
+// getRandomValues needs to be invoked in a context where "this" is a Crypto
+// implementation. Also, find the complete implementation of crypto on IE11.
+var getRandomValues = (typeof(crypto) != 'undefined' && crypto.getRandomValues && crypto.getRandomValues.bind(crypto)) ||
+                      (typeof(msCrypto) != 'undefined' && typeof window.msCrypto.getRandomValues == 'function' && msCrypto.getRandomValues.bind(msCrypto));
+
+if (getRandomValues) {
+  // WHATWG crypto RNG - http://wiki.whatwg.org/wiki/Crypto
+  var rnds8 = new Uint8Array(16); // eslint-disable-line no-undef
+
+  module.exports = function whatwgRNG() {
+    getRandomValues(rnds8);
+    return rnds8;
+  };
+} else {
   // Math.random()-based (RNG)
   //
   // If all else fails, use Math.random().  It's fast, but is of unspecified
   // quality.
-  var  _rnds = new Array(16);
-  rng = function() {
+  var rnds = new Array(16);
+
+  module.exports = function mathRNG() {
     for (var i = 0, r; i < 16; i++) {
       if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
-      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
+      rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
     }
 
-    return _rnds;
+    return rnds;
   };
 }
 
-module.exports = rng;
+},{}],24:[function(require,module,exports){
+var rng = require('./lib/rng');
+var bytesToUuid = require('./lib/bytesToUuid');
 
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],23:[function(require,module,exports){
-//     uuid.js
-//
-//     Copyright (c) 2010-2012 Robert Kieffer
-//     MIT License - http://opensource.org/licenses/mit-license.php
-
-// Unique ID creation requires a high quality random # generator.  We feature
-// detect to determine the best RNG source, normalizing to a function that
-// returns 128-bits of randomness, since that's what's usually required
-var _rng = require('./rng');
-
-// Maps for number <-> hex string conversion
-var _byteToHex = [];
-var _hexToByte = {};
-for (var i = 0; i < 256; i++) {
-  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
-  _hexToByte[_byteToHex[i]] = i;
-}
-
-// **`parse()` - Parse a UUID into it's component bytes**
-function parse(s, buf, offset) {
-  var i = (buf && offset) || 0, ii = 0;
-
-  buf = buf || [];
-  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
-    if (ii < 16) { // Don't overflow!
-      buf[i + ii++] = _hexToByte[oct];
-    }
-  });
-
-  // Zero out remaining bytes if string was short
-  while (ii < 16) {
-    buf[i + ii++] = 0;
-  }
-
-  return buf;
-}
-
-// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
-function unparse(buf, offset) {
-  var i = offset || 0, bth = _byteToHex;
-  return  bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]];
-}
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-// random #'s we need to init node and clockseq
-var _seedBytes = _rng();
-
-// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-var _nodeId = [
-  _seedBytes[0] | 0x01,
-  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
-];
-
-// Per 4.2.2, randomize (14 bit) clockseq
-var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
-
-// Previous uuid creation time
-var _lastMSecs = 0, _lastNSecs = 0;
-
-// See https://github.com/broofa/node-uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  }
-
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  }
-
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
-
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  var node = options.node || _nodeId;
-  for (var n = 0; n < 6; n++) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : unparse(b);
-}
-
-// **`v4()` - Generate random UUID**
-
-// See https://github.com/broofa/node-uuid for API details
 function v4(options, buf, offset) {
-  // Deprecated - 'format' argument, as supported in v1.2
   var i = buf && offset || 0;
 
   if (typeof(options) == 'string') {
-    buf = options == 'binary' ? new Array(16) : null;
+    buf = options === 'binary' ? new Array(16) : null;
     options = null;
   }
   options = options || {};
 
-  var rnds = options.random || (options.rng || _rng)();
+  var rnds = options.random || (options.rng || rng)();
 
   // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
   rnds[6] = (rnds[6] & 0x0f) | 0x40;
@@ -4203,24 +4193,17 @@ function v4(options, buf, offset) {
 
   // Copy bytes to buffer, if provided
   if (buf) {
-    for (var ii = 0; ii < 16; ii++) {
+    for (var ii = 0; ii < 16; ++ii) {
       buf[i + ii] = rnds[ii];
     }
   }
 
-  return buf || unparse(rnds);
+  return buf || bytesToUuid(rnds);
 }
 
-// Export public API
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-uuid.parse = parse;
-uuid.unparse = unparse;
+module.exports = v4;
 
-module.exports = uuid;
-
-},{"./rng":22}],24:[function(require,module,exports){
+},{"./lib/bytesToUuid":22,"./lib/rng":23}],25:[function(require,module,exports){
 /*
 WildEmitter.js is a slim little event emitter by @henrikjoreteg largely based
 on @visionmedia's Emitter from UI Kit.
